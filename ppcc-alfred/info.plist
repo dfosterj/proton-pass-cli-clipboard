@@ -93,7 +93,10 @@
 				<string>Searching...</string>
 				<key>script</key>
 				<string>SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &amp;&amp; pwd)"
-"$SCRIPT_DIR/search.sh" {query}</string>
+val=$("$SCRIPT_DIR/search.sh" $@)
+cat &lt;&lt; EOB
+$val
+EOB</string>
 				<key>scriptargtype</key>
 				<integer>1</integer>
 				<key>scriptfile</key>
@@ -141,7 +144,10 @@
 				<string>Loading fields...</string>
 				<key>script</key>
 				<string>SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &amp;&amp; pwd)"
-"$SCRIPT_DIR/fields.sh" "{query}"</string>
+val=$("$SCRIPT_DIR/fields.sh" "$1")
+cat &lt;&lt; EOB
+$val
+EOB</string>
 				<key>scriptargtype</key>
 				<integer>0</integer>
 				<key>scriptfile</key>

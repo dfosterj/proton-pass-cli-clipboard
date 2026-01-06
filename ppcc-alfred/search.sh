@@ -4,40 +4,61 @@
 # Usage: search.sh [--vault VAULT] [--type TYPE] SEARCH_PHRASE
 # Or: search.sh FIELD_QUERY (format: ITEM_ID|VAULT|TYPE|EMAIL|USERNAME|PASSWORD|URL)
 
-set -euo pipefail
+set +euo pipefail
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Check if this is a field query (contains pipe separators)
 if [[ "${1:-}" == *"|"* ]]; then
-    # This is a field selection query, delegate to fields.sh
-    "$(dirname "$0")/fields.sh" "$1"
+    "$SCRIPT_DIR/fields.sh" "$1"
     exit 0
 fi
 
-# Parse arguments for search
+# Parse arguments
 VAULT="Work"
 TYPE="login"
 SEARCH_PHRASE=""
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
+# Alfred with scriptargtype=1 passes arguments split by spaces
+# So "ppcc github" becomes: search.sh "github"
+# And "ppcc --vault Personal github" becomes: search.sh "--vault" "Personal" "github"
+
+# Collect all non-flag arguments as search phrase
+ARGS=("$@")
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+    case "${ARGS[$i]}" in
         --vault)
-            VAULT="$2"
-            shift 2
+            if [ $((i + 1)) -lt ${#ARGS[@]} ]; then
+                VAULT="${ARGS[$((i + 1))]}"
+                i=$((i + 2))
+            else
+                i=$((i + 1))
+            fi
             ;;
         --type)
-            TYPE="$2"
-            shift 2
+            if [ $((i + 1)) -lt ${#ARGS[@]} ]; then
+                TYPE="${ARGS[$((i + 1))]}"
+                i=$((i + 2))
+            else
+                i=$((i + 1))
+            fi
             ;;
         *)
+            # Everything else is part of the search phrase
             if [ -z "$SEARCH_PHRASE" ]; then
-                SEARCH_PHRASE="$1"
+                SEARCH_PHRASE="${ARGS[$i]}"
             else
-                SEARCH_PHRASE="$SEARCH_PHRASE $1"
+                SEARCH_PHRASE="$SEARCH_PHRASE ${ARGS[$i]}"
             fi
-            shift
+            i=$((i + 1))
             ;;
     esac
 done
+
+# Trim whitespace
+SEARCH_PHRASE=$(printf '%s' "$SEARCH_PHRASE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
 # If no search phrase, show empty result
 if [ -z "$SEARCH_PHRASE" ]; then
@@ -46,7 +67,12 @@ if [ -z "$SEARCH_PHRASE" ]; then
 fi
 
 # Get items from pass-cli
-ITEMS_JSON=$(pass-cli item list "$VAULT" --filter-type "$TYPE" --output json 2>/dev/null || echo '{"items":[]}')
+ITEMS_JSON=$(pass-cli item list "$VAULT" --filter-type "$TYPE" --output json 2>/dev/null)
+
+if [ $? -ne 0 ] || [ -z "$ITEMS_JSON" ]; then
+    echo "{\"items\": [{\"title\": \"Error\", \"subtitle\": \"Failed to retrieve items from vault '$VAULT'\", \"valid\": false}]}"
+    exit 0
+fi
 
 # Convert type to JSON key format
 case "$TYPE" in
@@ -61,7 +87,7 @@ case "$TYPE" in
     *) TYPE_KEY=$(echo "$TYPE" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}') ;;
 esac
 
-# Search for items matching the search phrase in URLs
+# Search for items matching the search phrase in URLs - EXACT same as ppcc script
 MATCHING_ITEMS=$(echo "$ITEMS_JSON" | jq -r --arg search "$SEARCH_PHRASE" --arg type "$TYPE_KEY" '
   .items[] | 
   select(
@@ -74,36 +100,32 @@ MATCHING_ITEMS=$(echo "$ITEMS_JSON" | jq -r --arg search "$SEARCH_PHRASE" --arg 
     urls: (.content.content[$type].urls // []),
     email: (.content.content[$type].email // ""),
     username: (.content.content[$type].username // ""),
-    password: (.content.content[$type].password // ""),
-    vault: "'"$VAULT"'",
-    type: "'"$TYPE"'"
+    password: (.content.content[$type].password // "")
   }
 ' | jq -s '.')
 
-# Check if any matches found
 MATCH_COUNT=$(echo "$MATCHING_ITEMS" | jq 'length')
 
 if [ "$MATCH_COUNT" -eq 0 ]; then
-    echo '{"items": [{"title": "No items found", "subtitle": "No items matching \"'"$SEARCH_PHRASE"'\" in vault \"'"$VAULT"'\"", "valid": false}]}'
+    echo "{\"items\": [{\"title\": \"No items found\", \"subtitle\": \"No items matching \\\"$SEARCH_PHRASE\\\" in vault \\\"$VAULT\\\"\", \"valid\": false}]}"
     exit 0
 fi
 
-# Output Alfred JSON format with Cmd modifier to show fields
-echo "$MATCHING_ITEMS" | jq -r '
+# Format for Alfred - simplified jq query
+echo "$MATCHING_ITEMS" | jq -r --arg vault "$VAULT" --arg type "$TYPE" '
   {
     items: [
-      .[] | {
+      .[] |
+      {
         title: .title,
-        subtitle: (.urls | join(", ")) + " • Press Cmd to view fields",
-        arg: (.id + "|" + .vault + "|" + .type + "|" + .email + "|" + .username + "|" + .password + "|" + (.urls[0] // "")),
+        subtitle: (if (.urls | length) > 0 then ((.urls | join(", ")) + " • Press Cmd to view fields") else ("No URLs" + " • Press Cmd to view fields") end),
+        arg: (.id + "|" + $vault + "|" + $type + "|" + (.email // "") + "|" + (.username // "") + "|" + (.password // "") + "|" + (if (.urls | length) > 0 then (.urls[0] // "") else "" end)),
         valid: true,
-        text: {
-          copy: .title
-        },
+        text: { copy: .title },
         mods: {
           cmd: {
-            arg: (.id + "|" + .vault + "|" + .type + "|" + .email + "|" + .username + "|" + .password + "|" + (.urls[0] // "")),
-            subtitle: "View fields for: " + .title,
+            arg: (.id + "|" + $vault + "|" + $type + "|" + (.email // "") + "|" + (.username // "") + "|" + (.password // "") + "|" + (if (.urls | length) > 0 then (.urls[0] // "") else "" end)),
+            subtitle: ("View fields for: " + .title),
             valid: true
           }
         }
