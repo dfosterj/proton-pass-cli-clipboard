@@ -1,0 +1,206 @@
+#!/bin/bash
+
+# Proton Pass Clipboard CLI - Password manager search and copy script
+# Usage: ppcc [--type TYPE] [--vault VAULT] SEARCH_PHRASE
+
+set -euo pipefail
+
+# Default values
+TYPE="login"
+VAULT="Work"
+SEARCH_PHRASE=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --type)
+            TYPE="$2"
+            shift 2
+            ;;
+        --vault)
+            VAULT="$2"
+            shift 2
+            ;;
+        *)
+            if [ -z "$SEARCH_PHRASE" ]; then
+                SEARCH_PHRASE="$1"
+            else
+                echo "Error: Multiple search phrases provided. Only one is allowed."
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Check if search phrase is provided
+if [ -z "$SEARCH_PHRASE" ]; then
+    echo "Error: Search phrase is required"
+    echo "Usage: ppcc [--type TYPE] [--vault VAULT] SEARCH_PHRASE"
+    echo "  --type: note, login, alias, credit-card, identity, ssh-key, wifi, custom (default: login)"
+    echo "  --vault: vault name (default: Work)"
+    echo "  SEARCH_PHRASE: phrase to search in URLs (required)"
+    exit 1
+fi
+
+# Validate type
+VALID_TYPES=("note" "login" "alias" "credit-card" "identity" "ssh-key" "wifi" "custom")
+if [[ ! " ${VALID_TYPES[@]} " =~ " ${TYPE} " ]]; then
+    echo "Error: Invalid type '$TYPE'. Must be one of: ${VALID_TYPES[*]}"
+    exit 1
+fi
+
+# Get items from pass-cli
+ITEMS_JSON=$(pass-cli item list "$VAULT" --filter-type "$TYPE" --output json 2>/dev/null)
+
+if [ $? -ne 0 ] || [ -z "$ITEMS_JSON" ]; then
+    echo "Error: Failed to retrieve items from vault '$VAULT'"
+    exit 1
+fi
+
+# Convert type to JSON key format (login -> Login, credit-card -> CreditCard, etc.)
+case "$TYPE" in
+    login) TYPE_KEY="Login" ;;
+    note) TYPE_KEY="Note" ;;
+    alias) TYPE_KEY="Alias" ;;
+    credit-card) TYPE_KEY="CreditCard" ;;
+    identity) TYPE_KEY="Identity" ;;
+    ssh-key) TYPE_KEY="SSHKey" ;;
+    wifi) TYPE_KEY="WiFi" ;;
+    custom) TYPE_KEY="Custom" ;;
+    *) TYPE_KEY=$(echo "$TYPE" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}') ;;
+esac
+
+# Search for items matching the search phrase in URLs
+MATCHING_ITEMS=$(echo "$ITEMS_JSON" | jq -r --arg search "$SEARCH_PHRASE" --arg type "$TYPE_KEY" '
+  .items[] | 
+  select(
+    (.content.content[$type].urls // [])[]? | 
+    test($search; "i")
+  ) | 
+  {
+    id: .id,
+    title: .content.title,
+    urls: (.content.content[$type].urls // []),
+    email: (.content.content[$type].email // ""),
+    username: (.content.content[$type].username // ""),
+    password: (.content.content[$type].password // "")
+  }
+' | jq -s '.')
+
+# Check if any matches found
+MATCH_COUNT=$(echo "$MATCHING_ITEMS" | jq 'length')
+
+if [ "$MATCH_COUNT" -eq 0 ]; then
+    echo "No items found matching '$SEARCH_PHRASE' in URLs"
+    exit 1
+fi
+
+# Display matching items
+echo "Found $MATCH_COUNT matching item(s):"
+echo ""
+for i in $(seq 0 $((MATCH_COUNT - 1))); do
+    ITEM=$(echo "$MATCHING_ITEMS" | jq -r ".[$i]")
+    TITLE=$(echo "$ITEM" | jq -r '.title')
+    URLS=$(echo "$ITEM" | jq -r '.urls | join(", ")')
+    NUM=$((i + 1))
+    echo "$NUM) $TITLE | URLs: $URLS"
+done
+
+# If only one match, use it automatically
+if [ "$MATCH_COUNT" -eq 1 ]; then
+    SELECTED_INDEX=1
+    echo ""
+    echo "Only one match found, selecting automatically..."
+else
+    echo ""
+    read -p "Select item (1-$MATCH_COUNT): " SELECTED_INDEX
+    
+    if ! [[ "$SELECTED_INDEX" =~ ^[0-9]+$ ]] || [ "$SELECTED_INDEX" -lt 1 ] || [ "$SELECTED_INDEX" -gt "$MATCH_COUNT" ]; then
+        echo "Error: Invalid selection"
+        exit 1
+    fi
+fi
+
+# Get selected item (convert to 0-based index)
+SELECTED_ITEM=$(echo "$MATCHING_ITEMS" | jq -r ".[$((SELECTED_INDEX - 1))]")
+ITEM_ID=$(echo "$SELECTED_ITEM" | jq -r '.id')
+ITEM_TITLE=$(echo "$SELECTED_ITEM" | jq -r '.title')
+
+# Get the full item details
+FULL_ITEM=$(echo "$ITEMS_JSON" | jq -r --arg id "$ITEM_ID" '.items[] | select(.id == $id)')
+
+# Extract fields using capitalized type key
+EMAIL=$(echo "$FULL_ITEM" | jq -r ".content.content[\"$TYPE_KEY\"].email // \"\"")
+USERNAME=$(echo "$FULL_ITEM" | jq -r ".content.content[\"$TYPE_KEY\"].username // \"\"")
+PASSWORD=$(echo "$FULL_ITEM" | jq -r ".content.content[\"$TYPE_KEY\"].password // \"\"")
+URLS=$(echo "$FULL_ITEM" | jq -r ".content.content[\"$TYPE_KEY\"].urls[]? // \"\"" | head -1)
+
+echo ""
+echo "Selected: $ITEM_TITLE"
+echo ""
+echo "Available fields:"
+[ -n "$EMAIL" ] && echo "  e) Email: $EMAIL"
+[ -n "$USERNAME" ] && echo "  n) Username: $USERNAME"
+[ -n "$PASSWORD" ] && echo "  p) Password: [hidden]"
+[ -n "$URLS" ] && echo "  u) URL: $URLS"
+echo ""
+
+read -p "Copy to clipboard (e/n/p/u): " CHOICE
+
+# Determine clipboard command (cross-platform support)
+# macOS: pbcopy
+# Linux: xclip (preferred) or xsel (fallback)
+if command -v pbcopy >/dev/null 2>&1; then
+    CLIP_CMD="pbcopy"
+elif command -v xclip >/dev/null 2>&1; then
+    # xclip for Linux - use clipboard selection
+    CLIP_CMD="xclip -selection clipboard"
+elif command -v xsel >/dev/null 2>&1; then
+    # xsel for Linux (alternative)
+    CLIP_CMD="xsel --clipboard --input"
+else
+    echo "Error: No clipboard utility found"
+    echo "  macOS: pbcopy (built-in)"
+    echo "  Linux: Install xclip (apt install xclip) or xsel (apt install xsel)"
+    exit 1
+fi
+
+case "$CHOICE" in
+    e|E)
+        if [ -z "$EMAIL" ]; then
+            echo "Error: Email field is empty"
+            exit 1
+        fi
+        echo -n "$EMAIL" | $CLIP_CMD
+        echo "✓ Email copied to clipboard"
+        ;;
+    n|N)
+        if [ -z "$USERNAME" ]; then
+            echo "Error: Username field is empty"
+            exit 1
+        fi
+        echo -n "$USERNAME" | $CLIP_CMD
+        echo "✓ Username copied to clipboard"
+        ;;
+    p|P)
+        if [ -z "$PASSWORD" ]; then
+            echo "Error: Password field is empty"
+            exit 1
+        fi
+        echo -n "$PASSWORD" | $CLIP_CMD
+        echo "✓ Password copied to clipboard"
+        ;;
+    u|U)
+        if [ -z "$URLS" ]; then
+            echo "Error: URL field is empty"
+            exit 1
+        fi
+        echo -n "$URLS" | $CLIP_CMD
+        echo "✓ URL copied to clipboard"
+        ;;
+    *)
+        echo "Error: Invalid choice. Use e, n, p, or u"
+        exit 1
+        ;;
+esac
